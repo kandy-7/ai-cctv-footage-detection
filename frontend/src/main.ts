@@ -2,8 +2,33 @@ import './style.css'
 
 const API_BASE = 'http://localhost:8001';
 
-let currentVideoId: string | null = null;
+// ── Type definitions ──────────────────────────────────────────────────────────
+interface EventResult {
+  timestamp: number;
+  video_url: string;
+  classes: string[];
+  count: number;
+  confidence?: number;
+}
 
+interface QueryResponse {
+  found: boolean;
+  events: EventResult[];
+  total_matches: number;
+  message?: string;
+}
+
+interface StatusResponse {
+  status: 'processing' | 'done';
+  event_count: number;
+}
+
+// ── App state ─────────────────────────────────────────────────────────────────
+let currentVideoId: string | null = null;
+let pollingTimer: ReturnType<typeof setInterval> | null = null;
+let activeEventIndex = 0;
+
+// ── HTML scaffold ─────────────────────────────────────────────────────────────
 document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <div class="container">
     <header class="header">
@@ -13,9 +38,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
         </svg>
         <h1>AI CCTV Analysis</h1>
       </div>
-      <div class="status-indicator">
+      <div class="status-indicator" id="statusIndicator">
         <span class="status-dot"></span>
-        <span>System Ready</span>
+        <span id="statusText">System Ready</span>
       </div>
     </header>
 
@@ -30,7 +55,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
           </svg>
-          <p class="upload-text">Drag & drop your video or <label for="fileInput" class="upload-link">browse</label></p>
+          <p class="upload-text">Drag &amp; drop your video or <label for="fileInput" class="upload-link">browse</label></p>
           <p class="upload-hint">Supports MP4, AVI, MOV formats</p>
           <input type="file" id="fileInput" accept="video/*" hidden />
         </div>
@@ -44,7 +69,13 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <svg class="success-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
           </svg>
-          <p>Video uploaded successfully! Processing in progress...</p>
+          <p id="uploadSuccessText">Video uploaded! Processing...</p>
+        </div>
+
+        <!-- Processing Status -->
+        <div class="processing-status" id="processingStatus" style="display: none;">
+          <div class="processing-spinner"></div>
+          <span id="processingText">Processing video... 0 events found</span>
         </div>
       </section>
 
@@ -55,10 +86,10 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <p>Ask questions about your footage in plain English</p>
         </div>
         <div class="query-input-container">
-          <input 
-            type="text" 
-            id="queryInput" 
-            class="query-input" 
+          <input
+            type="text"
+            id="queryInput"
+            class="query-input"
             placeholder="e.g., 'Show me when a person appears' or 'Find cars in the video'"
           />
           <button id="searchBtn" class="btn btn-primary">
@@ -89,18 +120,27 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     </main>
 
     <footer class="footer">
-      <p>Powered by YOLOv8 & FastAPI | AI-Enhanced Video Analysis</p>
+      <p>Powered by YOLOv8 &amp; FastAPI | AI-Enhanced Video Analysis</p>
     </footer>
   </div>
 `;
 
-// Upload functionality
-const uploadArea = document.getElementById('uploadArea') as HTMLDivElement;
-const fileInput = document.getElementById('fileInput') as HTMLInputElement;
+// ── DOM references ────────────────────────────────────────────────────────────
+const uploadArea        = document.getElementById('uploadArea')        as HTMLDivElement;
+const fileInput         = document.getElementById('fileInput')         as HTMLInputElement;
 const progressContainer = document.getElementById('progressContainer') as HTMLDivElement;
-const uploadSuccess = document.getElementById('uploadSuccess') as HTMLDivElement;
-const querySection = document.getElementById('querySection') as HTMLElement;
+const uploadSuccess     = document.getElementById('uploadSuccess')     as HTMLDivElement;
+const uploadSuccessText = document.getElementById('uploadSuccessText') as HTMLParagraphElement;
+const querySection      = document.getElementById('querySection')      as HTMLElement;
+const processingStatus  = document.getElementById('processingStatus')  as HTMLDivElement;
+const processingText    = document.getElementById('processingText')    as HTMLSpanElement;
+const queryInput        = document.getElementById('queryInput')        as HTMLInputElement;
+const searchBtn         = document.getElementById('searchBtn')         as HTMLButtonElement;
+const resultsSection    = document.getElementById('resultsSection')    as HTMLElement;
+const resultsContent    = document.getElementById('resultsContent')    as HTMLDivElement;
+const statusText        = document.getElementById('statusText')        as HTMLSpanElement;
 
+// ── Upload ────────────────────────────────────────────────────────────────────
 uploadArea.addEventListener('click', () => fileInput.click());
 
 uploadArea.addEventListener('dragover', (e) => {
@@ -116,16 +156,12 @@ uploadArea.addEventListener('drop', (e) => {
   e.preventDefault();
   uploadArea.classList.remove('drag-over');
   const files = e.dataTransfer?.files;
-  if (files && files.length > 0) {
-    handleFileUpload(files[0]);
-  }
+  if (files && files.length > 0) handleFileUpload(files[0]);
 });
 
 fileInput.addEventListener('change', (e) => {
   const files = (e.target as HTMLInputElement).files;
-  if (files && files.length > 0) {
-    handleFileUpload(files[0]);
-  }
+  if (files && files.length > 0) handleFileUpload(files[0]);
 });
 
 async function handleFileUpload(file: File) {
@@ -148,13 +184,10 @@ async function handleFileUpload(file: File) {
 
     progressContainer.style.display = 'none';
     uploadSuccess.style.display = 'flex';
-    querySection.style.display = 'block';
+    uploadSuccessText.textContent = `Video uploaded! ID: ${currentVideoId}`;
 
-    // Simulate processing time
-    setTimeout(() => {
-      const statusText = document.querySelector('.status-indicator span:last-child') as HTMLSpanElement;
-      statusText.textContent = 'Processing Complete';
-    }, 2000);
+    // Start polling
+    startStatusPolling(currentVideoId!);
 
   } catch (error) {
     console.error('Upload error:', error);
@@ -167,20 +200,57 @@ function resetUpload() {
   uploadArea.style.display = 'flex';
   progressContainer.style.display = 'none';
   uploadSuccess.style.display = 'none';
+  processingStatus.style.display = 'none';
+  querySection.style.display = 'none';
+  if (pollingTimer !== null) {
+    clearInterval(pollingTimer);
+    pollingTimer = null;
+  }
 }
 
-// Query functionality
-const queryInput = document.getElementById('queryInput') as HTMLInputElement;
-const searchBtn = document.getElementById('searchBtn') as HTMLButtonElement;
-const resultsSection = document.getElementById('resultsSection') as HTMLElement;
-const resultsContent = document.getElementById('resultsContent') as HTMLDivElement;
+// ── Task A: Status polling ────────────────────────────────────────────────────
+function startStatusPolling(videoId: string) {
+  processingStatus.style.display = 'flex';
+  processingText.textContent = 'Processing video... 0 events found';
+  statusText.textContent = 'Processing...';
 
+  async function poll() {
+    try {
+      const res = await fetch(`${API_BASE}/status/${videoId}`);
+      if (!res.ok) return; // keep polling on transient errors
+      const data: StatusResponse = await res.json();
+
+      processingText.textContent = `Processing video... ${data.event_count} events found`;
+
+      if (data.status === 'done') {
+        stopPolling();
+        processingText.textContent = `✓ Processing complete — ${data.event_count} events found`;
+        statusText.textContent = 'Processing Complete';
+        querySection.style.display = 'block';
+        querySection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    } catch (err) {
+      console.error('Status poll error:', err);
+    }
+  }
+
+  poll(); // immediate first check
+  pollingTimer = setInterval(poll, 3000);
+}
+
+function stopPolling() {
+  if (pollingTimer !== null) {
+    clearInterval(pollingTimer);
+    pollingTimer = null;
+  }
+}
+
+// ── Query / Search ────────────────────────────────────────────────────────────
 searchBtn.addEventListener('click', handleSearch);
 queryInput.addEventListener('keypress', (e) => {
   if (e.key === 'Enter') handleSearch();
 });
 
-// Example chips
 document.querySelectorAll('.chip').forEach(chip => {
   chip.addEventListener('click', () => {
     const query = chip.getAttribute('data-query');
@@ -209,12 +279,12 @@ async function handleSearch() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         video_id: currentVideoId,
-        query: query,
-        threshold: 0.5
-      })
+        query,
+        threshold: 0.5,
+      }),
     });
 
-    const data = await response.json();
+    const data: QueryResponse = await response.json();
     displayResults(data, query);
 
   } catch (error) {
@@ -231,7 +301,8 @@ async function handleSearch() {
   }
 }
 
-function displayResults(data: any, query: string) {
+// ── Task B + C: Display results with layout + timeline ────────────────────────
+function displayResults(data: QueryResponse, query: string) {
   resultsSection.style.display = 'block';
 
   if (!data.found || !data.events || data.events.length === 0) {
@@ -247,49 +318,59 @@ function displayResults(data: any, query: string) {
         </div>
       </div>
     `;
-  } else {
-    const totalEvents = data.total_matches || data.events.length;
-    const firstEvent = data.events[0];
+    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return;
+  }
 
-    resultsContent.innerHTML = `
-      <div class="result-found">
-        <div class="result-header">
-          <div class="result-info">
-            <h3>Found ${totalEvents} matching moments</h3>
-            <p>The AI identified multiple events. Select a timestamp below to view the clip.</p>
-            <p class="query-text">Query: "${query}"</p>
-          </div>
-        </div>
-        
-        <div class="event-selector">
-          <p>Detected Events:</p>
-          <div class="event-timeline" id="eventTimeline">
-            ${data.events.map((ev: any, index: number) => `
-              <button class="event-chip ${index === 0 ? 'active' : ''}" 
-                      data-url="${ev.video_url}" 
-                      data-timestamp="${ev.timestamp}"
-                      data-classes="${ev.classes.join(', ')}">
-                <span class="time">${formatTime(ev.timestamp)}</span>
-                <span class="desc">${ev.classes.slice(0, 2).join(', ')}${ev.classes.length > 2 ? '...' : ''}</span>
-              </button>
-            `).join('')}
-          </div>
+  activeEventIndex = 0;
+  const totalEvents = data.total_matches || data.events.length;
+  const first = data.events[0];
+
+  resultsContent.innerHTML = `
+    <div class="result-found">
+      <div class="result-header">
+        <h3>Found ${totalEvents} matching moment${totalEvents !== 1 ? 's' : ''}</h3>
+        <p class="query-text">Query: &ldquo;${query}&rdquo;</p>
+      </div>
+
+      <div class="results-layout">
+        <!-- Left: event card list -->
+        <div class="events-panel" id="eventsPanel">
+          ${data.events.map((ev, i) => buildEventCard(ev, i)).join('')}
         </div>
 
-        <div class="video-display-area" id="videoDisplayArea">
+        <!-- Right: video + timeline -->
+        <div class="video-panel" id="videoPanel">
           <div class="video-container">
-            <video controls autoplay class="result-video" id="mainVideo">
-              <source src="${firstEvent.video_url}" type="video/mp4">
+            <video
+              controls
+              autoplay
+              class="result-video"
+              id="mainVideo"
+              src="${first.video_url}"
+            >
               Your browser does not support the video tag.
             </video>
-            <div class="video-badge">4K Enhanced</div>
           </div>
-          <div class="event-details" id="eventDetails">
-             <p>Showing event at <strong>${formatTime(firstEvent.timestamp)}</strong></p>
-             <p>Detected: ${firstEvent.classes.join(', ')}</p>
+
+          <!-- Timeline -->
+          <div class="timeline-wrapper">
+            <div class="timeline-container" id="timelineContainer">
+              <div class="timeline-track" id="timelineTrack">
+                <div class="timeline-progress" id="timelineProgress" style="width:0%"></div>
+                <div class="timeline-playhead" id="timelinePlayhead" style="left:0%"></div>
+              </div>
+              <div id="timelineMarkers"></div>
+            </div>
+            <div class="timeline-labels">
+              <span id="timeCurrent">0:00</span>
+              <span id="timeDuration">--:--</span>
+            </div>
           </div>
-          <div class="result-actions">
-            <a href="${firstEvent.video_url}" id="downloadLink" download class="btn btn-secondary">
+
+          <!-- Download -->
+          <div class="result-actions" style="margin-top:1rem;">
+            <a href="${first.video_url}" id="downloadLink" download class="btn btn-secondary">
               <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
               </svg>
@@ -298,47 +379,159 @@ function displayResults(data: any, query: string) {
           </div>
         </div>
       </div>
-    `;
+    </div>
+  `;
 
-    // Add event listeners to chips
-    setTimeout(() => {
-      const chips = document.querySelectorAll('.event-chip');
-      const video = document.getElementById('mainVideo') as HTMLVideoElement;
-      const downloadLink = document.getElementById('downloadLink') as HTMLAnchorElement;
-      const details = document.getElementById('eventDetails') as HTMLDivElement;
-
-      chips.forEach(chip => {
-        chip.addEventListener('click', () => {
-          // Update active state
-          chips.forEach(c => c.classList.remove('active'));
-          chip.classList.add('active');
-
-          // Update video source
-          const url = chip.getAttribute('data-url')!;
-          const timestamp = chip.getAttribute('data-timestamp')!;
-          const classes = chip.getAttribute('data-classes')!;
-
-          video.src = url;
-          video.load();
-          video.play();
-
-          // Update download link
-          downloadLink.href = url;
-
-          // Update details
-          details.innerHTML = `
-            <p>Showing event at <strong>${formatTime(parseFloat(timestamp))}</strong></p>
-            <p>Detected: ${classes}</p>
-          `;
-        });
-      });
-    }, 0);
-  }
+  // Wire up interactions after DOM update
+  setTimeout(() => {
+    wireResults(data.events);
+  }, 0);
 
   resultsSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+function buildEventCard(ev: EventResult, index: number): string {
+  const confidenceVal = ev.confidence != null ? ev.confidence : ev.count / 10;
+  const confPct = Math.min(100, Math.round(confidenceVal * 100));
+  const confColor = confPct >= 70 ? '#4caf50' : confPct >= 40 ? '#ff9800' : '#f44336';
+
+  return `
+    <div class="event-card ${index === 0 ? 'active' : ''}" data-index="${index}" data-url="${ev.video_url}">
+      <div class="event-card-inner">
+        <div class="event-badge">${index + 1}</div>
+        <div class="event-card-body">
+          <div class="event-time">${formatTime(ev.timestamp)}</div>
+          <div class="event-classes">${ev.classes.join(', ')}</div>
+          <div class="event-conf-bar">
+            <div class="event-conf-fill" style="width:${confPct}%;background:${confColor}"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function wireResults(events: EventResult[]) {
+  const video        = document.getElementById('mainVideo')       as HTMLVideoElement;
+  const downloadLink = document.getElementById('downloadLink')    as HTMLAnchorElement;
+  const cards        = document.querySelectorAll<HTMLElement>('.event-card');
+  const progress     = document.getElementById('timelineProgress') as HTMLDivElement;
+  const playhead     = document.getElementById('timelinePlayhead') as HTMLDivElement;
+  const timeCurrent  = document.getElementById('timeCurrent')    as HTMLSpanElement;
+  const timeDuration = document.getElementById('timeDuration')    as HTMLSpanElement;
+  const markersEl    = document.getElementById('timelineMarkers') as HTMLDivElement;
+
+  // ── Event card clicks ──
+  cards.forEach((card) => {
+    card.addEventListener('click', () => {
+      const idx = parseInt(card.getAttribute('data-index') || '0', 10);
+      selectEvent(idx, events, cards, video, downloadLink, markersEl);
+    });
+  });
+
+  // ── Video metadata / time update for timeline ──
+  video.addEventListener('loadedmetadata', () => {
+    const dur = video.duration;
+    timeDuration.textContent = isFinite(dur) ? formatTime(dur) : '--:--';
+    renderTimelineMarkers(events, markersEl, dur, (idx) => {
+      selectEvent(idx, events, cards, video, downloadLink, markersEl);
+    });
+  });
+
+  video.addEventListener('timeupdate', () => {
+    const dur = video.duration;
+    const cur = video.currentTime;
+    if (!isFinite(dur) || dur === 0) return;
+    const pct = (cur / dur) * 100;
+    progress.style.width = `${pct}%`;
+    playhead.style.left  = `${pct}%`;
+    timeCurrent.textContent = formatTime(cur);
+  });
+
+  // Initial marker render if metadata already loaded
+  if (isFinite(video.duration) && video.duration > 0) {
+    timeDuration.textContent = formatTime(video.duration);
+    renderTimelineMarkers(events, markersEl, video.duration, (idx) => {
+      selectEvent(idx, events, cards, video, downloadLink, markersEl);
+    });
+  }
+}
+
+function selectEvent(
+  idx: number,
+  events: EventResult[],
+  cards: NodeListOf<HTMLElement>,
+  video: HTMLVideoElement,
+  downloadLink: HTMLAnchorElement,
+  markersEl: HTMLDivElement,
+) {
+  activeEventIndex = idx;
+  const ev = events[idx];
+
+  // Update active card
+  cards.forEach((c) => c.classList.remove('active'));
+  cards[idx]?.classList.add('active');
+  cards[idx]?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  // Load clip
+  video.src = ev.video_url;
+  video.load();
+  video.currentTime = 0;
+  video.play().catch(() => {/* autoplay policy */ });
+
+  // Update download
+  downloadLink.href = ev.video_url;
+
+  // Reset timeline progress
+  const progress  = document.getElementById('timelineProgress') as HTMLDivElement;
+  const playhead  = document.getElementById('timelinePlayhead') as HTMLDivElement;
+  const timeCurrent = document.getElementById('timeCurrent')    as HTMLSpanElement;
+  const timeDuration = document.getElementById('timeDuration')  as HTMLSpanElement;
+  if (progress)  progress.style.width = '0%';
+  if (playhead)  playhead.style.left  = '0%';
+  if (timeCurrent) timeCurrent.textContent = '0:00';
+  if (timeDuration) timeDuration.textContent = '--:--';
+
+  // Highlight active marker
+  document.querySelectorAll<HTMLElement>('.timeline-marker').forEach((m, i) => {
+    m.classList.toggle('active-marker', i === idx);
+  });
+
+  // Re-render markers once new clip loads
+  video.addEventListener('loadedmetadata', () => {
+    const dur = video.duration;
+    if (timeDuration) timeDuration.textContent = isFinite(dur) ? formatTime(dur) : '--:--';
+    renderTimelineMarkers(events, markersEl, dur, (i) => {
+      selectEvent(i, events, cards, video, downloadLink, markersEl);
+    });
+  }, { once: true });
+}
+
+// ── Task C: Timeline markers ──────────────────────────────────────────────────
+function renderTimelineMarkers(
+  events: EventResult[],
+  container: HTMLDivElement,
+  totalDuration: number,
+  onClick: (idx: number) => void,
+) {
+  container.innerHTML = '';
+  if (!isFinite(totalDuration) || totalDuration <= 0) return;
+
+  events.forEach((ev, i) => {
+    const pct = Math.min(99, Math.max(1, (ev.timestamp / totalDuration) * 100));
+    const marker = document.createElement('div');
+    marker.className = `timeline-marker${i === activeEventIndex ? ' active-marker' : ''}`;
+    marker.style.left = `${pct}%`;
+    marker.title = `Event ${i + 1}: ${formatTime(ev.timestamp)} — ${ev.classes.join(', ')}`;
+    marker.textContent = '▲';
+    marker.addEventListener('click', () => onClick(i));
+    container.appendChild(marker);
+  });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function formatTime(seconds: number): string {
+  if (!isFinite(seconds) || seconds < 0) return '0:00';
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins}:${secs.toString().padStart(2, '0')}`;
