@@ -1,232 +1,432 @@
-"""
-enhancement.py — Smart clip extraction and upscaling for CCTV footage.
 
-Key improvements over the original:
-- Time-based seeking (CAP_PROP_POS_MSEC) instead of frame-number-based.
-- Adaptive output resolution (no forced 4K); respects a 1280px wide cap.
-- Aspect-ratio preservation.
-- Optional Super Resolution via ESPCN model; falls back to bicubic gracefully.
-- Robust codec selection (mp4v → XVID fallback).
-- Proper error handling and detailed logging.
+"""
+enhancement.py
+CCTV clip extraction, adaptive resizing, optional ESPCN
+super-resolution, and browser-compatible H.264 MP4 encoding.
 """
 
 import os
-import logging
 import cv2
-from cv2 import dnn_superres
+import math
+import logging
+import shutil
+import subprocess
+
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
+
+try:
+    from cv2 import dnn_superres
+except ImportError:
+    dnn_superres = None
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Super-resolution helpers
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
 
-def init_super_res(model_path: str = "ESPCN_x4.pb"):
-    """
-    Try to load the ESPCN x4 super-resolution model.
+MAX_OUTPUT_WIDTH = 1280
+MAX_OUTPUT_HEIGHT = 720
 
-    Returns a DnnSuperResImpl instance on success, or None when the model
-    file is absent (bicubic upscaling will be used instead).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SR_MODEL_PATH = os.path.join(BASE_DIR, "ESPCN_x4.pb")
+
+
+# ---------------------------------------------------------
+# FFMPEG DETECTION
+# ---------------------------------------------------------
+
+def get_ffmpeg_path():
     """
+    Locate FFmpeg using imageio-ffmpeg first,
+    then fall back to the system PATH.
+    """
+
+    if imageio_ffmpeg is not None:
+        try:
+            path = imageio_ffmpeg.get_ffmpeg_exe()
+
+            if path and os.path.isfile(path):
+                logger.info("Using imageio FFmpeg: %s", path)
+                return path
+
+        except Exception:
+            logger.exception("Could not locate imageio FFmpeg.")
+
+    path = shutil.which("ffmpeg")
+
+    if path:
+        logger.info("Using system FFmpeg: %s", path)
+        return path
+
+    logger.error(
+        "FFmpeg not found. Install it using: "
+        "python -m pip install imageio-ffmpeg"
+    )
+
+    return None
+
+
+# ---------------------------------------------------------
+# SUPER RESOLUTION
+# ---------------------------------------------------------
+
+def init_super_res(model_path=SR_MODEL_PATH):
+    """Load optional ESPCN x4 super-resolution model."""
+
+    if dnn_superres is None:
+        logger.warning("OpenCV super-resolution module unavailable.")
+        return None
+
     if not os.path.exists(model_path):
         logger.warning(
-            "SR model '%s' not found — bicubic upscaling will be used.", model_path
+            "ESPCN model not found. Using bicubic resizing."
         )
         return None
 
     try:
         sr = dnn_superres.DnnSuperResImpl_create()
         sr.readModel(model_path)
-        sr.setModel("espcn", 4)  # scale factor 4
-        logger.info("Super-resolution model loaded from '%s'.", model_path)
+        sr.setModel("espcn", 4)
+
+        logger.info("ESPCN super-resolution model loaded.")
         return sr
-    except Exception as exc:
-        logger.warning("Failed to load SR model (%s) — using bicubic.", exc)
+
+    except Exception:
+        logger.exception("Could not load ESPCN model.")
         return None
 
 
-# ---------------------------------------------------------------------------
-# Resolution helpers
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# RESOLUTION HANDLING
+# ---------------------------------------------------------
 
-MAX_OUTPUT_WIDTH = 1280   # cap for browser playback performance
-MAX_OUTPUT_HEIGHT = 720
+def _compute_target_resolution(width, height):
+    """Calculate output dimensions while preserving aspect ratio."""
 
-def _compute_target_resolution(width: int, height: int) -> tuple[int, int]:
-    """
-    Decide the output (target_width, target_height) given the source dimensions.
+    if width <= 0 or height <= 0:
+        raise ValueError("Invalid source video dimensions.")
 
-    Rules:
-      - area <= 640x480  → try 2x upscale
-      - area <= 1280x720 → try 1.5x upscale
-      - area >  1280x720 → keep original (never downscale)
-      - Hard cap: output width <= MAX_OUTPUT_WIDTH, height <= MAX_OUTPUT_HEIGHT
-      - Aspect ratio is always preserved.
-    """
-    area = width * height
-
-    if area <= 640 * 480:
+    if width * height <= 640 * 480:
         desired_scale = 2.0
-    elif area <= 1280 * 720:
-        desired_scale = 1.5
-    else:
-        desired_scale = 1.0  # already large enough
 
-    # Scale factor is limited so we never exceed the browser-playback cap.
+    elif width * height <= 1280 * 720:
+        desired_scale = 1.5
+
+    else:
+        desired_scale = 1.0
+
     scale = min(
         desired_scale,
         MAX_OUTPUT_WIDTH / width,
-        MAX_OUTPUT_HEIGHT / height,
+        MAX_OUTPUT_HEIGHT / height
     )
 
-    # Never shrink the video — if the source is already above the cap we
-    # do want to cap it, but do not go below the cap if scale < 1.
-    # Spec says "if original is already > 1280 wide, keep it at original
-    # but cap at 1280" — so a scale < 1 is allowed only to enforce the cap.
-    # However, if the original is smaller and desired_scale would not increase
-    # the size, still apply it (edge case: scale already < 1 from div alone).
+    target_width = max(2, int(round(width * scale)))
+    target_height = max(2, int(round(height * scale)))
 
-    target_width = max(1, round(width * scale))
-    target_height = max(1, round(height * scale))
-
-    # Make dimensions even (required by most codecs).
-    target_width += target_width % 2
-    target_height += target_height % 2
+    # Ensure even dimensions for video encoding.
+    target_width -= target_width % 2
+    target_height -= target_height % 2
 
     return target_width, target_height
 
 
-# ---------------------------------------------------------------------------
-# Main function
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# MAIN CLIP EXTRACTION
+# ---------------------------------------------------------
 
 def upscale_clip(
     input_path: str,
     output_path: str,
     start_time: float,
-    end_time: float,
+    end_time: float
 ) -> bool:
-    """
-    Extract a time segment from *input_path* and write it to *output_path*,
-    applying smart upscaling.
 
-    Parameters
-    ----------
-    input_path  : source video file path
-    output_path : destination .mp4 file path
-    start_time  : clip start in seconds (float)
-    end_time    : clip end   in seconds (float)
-
-    Returns
-    -------
-    True on success, False on failure.
-    """
-    logger.info(
-        "upscale_clip: input='%s' start=%.3fs end=%.3fs",
-        input_path, start_time, end_time,
-    )
-
-    # ------------------------------------------------------------------
-    # Open source video
-    # ------------------------------------------------------------------
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        logger.error("Cannot open video file: '%s'", input_path)
-        return False
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0  # sane default if unreadable
-    src_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    logger.info("Source: %dx%d @ %.2f fps", src_width, src_height, fps)
-
-    # ------------------------------------------------------------------
-    # Seek to start using millisecond-based position (more reliable than
-    # frame-number seeking for variable-FPS or B-frame videos).
-    # ------------------------------------------------------------------
-    cap.set(cv2.CAP_PROP_POS_MSEC, start_time * 1000.0)
-    actual_pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
-    actual_pos_sec = actual_pos_msec / 1000.0
-    logger.info(
-        "Seek: requested=%.3fs  actual=%.3fs  (delta=%.3fs)",
-        start_time, actual_pos_sec, actual_pos_sec - start_time,
-    )
-
-    # ------------------------------------------------------------------
-    # Compute output resolution
-    # ------------------------------------------------------------------
-    target_width, target_height = _compute_target_resolution(src_width, src_height)
-    logger.info("Output resolution: %dx%d", target_width, target_height)
-
-    # ------------------------------------------------------------------
-    # Initialise VideoWriter — try mp4v first, fall back to XVID.
-    # ------------------------------------------------------------------
-    if not output_path.lower().endswith(".mp4"):
-        output_path = os.path.splitext(output_path)[0] + ".mp4"
-
+    cap = None
     out = None
-    for codec in ("mp4v", "XVID"):
-        fourcc = cv2.VideoWriter_fourcc(*codec)
-        writer = cv2.VideoWriter(
-            output_path, fourcc, fps, (target_width, target_height)
-        )
-        if writer.isOpened():
-            out = writer
-            logger.info("VideoWriter opened with codec '%s'.", codec)
-            break
-        logger.warning("Codec '%s' failed, trying next…", codec)
-
-    if out is None:
-        logger.error("Could not open VideoWriter for '%s'.", output_path)
-        cap.release()
-        return False
-
-    # ------------------------------------------------------------------
-    # Load optional super-resolution model
-    # ------------------------------------------------------------------
-    sr = init_super_res()
-
-    # ------------------------------------------------------------------
-    # Read & write frames until end_time
-    # ------------------------------------------------------------------
-    frames_written = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break  # end of file or read error
-
-        # Time-based stop condition — no frame-count arithmetic.
-        current_pos_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        if current_pos_sec >= end_time:
-            break
-
-        # --- Upscale / resize the frame ---
-        if sr is not None:
-            # AI super-resolution (x4), then cap to target size.
-            upscaled = sr.upsample(frame)
-            final_frame = cv2.resize(
-                upscaled, (target_width, target_height),
-                interpolation=cv2.INTER_LANCZOS4,
-            )
-        else:
-            # Bicubic interpolation — fast and decent quality.
-            final_frame = cv2.resize(
-                frame, (target_width, target_height),
-                interpolation=cv2.INTER_CUBIC,
-            )
-
-        out.write(final_frame)
-        frames_written += 1
-
-    # ------------------------------------------------------------------
-    # Clean up
-    # ------------------------------------------------------------------
-    cap.release()
-    out.release()
+    temp_path = None
 
     logger.info(
-        "upscale_clip done: output='%s'  resolution=%dx%d  frames=%d",
-        output_path, target_width, target_height, frames_written,
+        "Starting clip extraction: %s | %.2f - %.2f seconds",
+        input_path,
+        start_time,
+        end_time
     )
-    return True
+
+    try:
+
+        # 1. Validate input
+        if not os.path.isfile(input_path):
+            logger.error("Input video does not exist: %s", input_path)
+            return False
+
+        if (
+            not math.isfinite(start_time)
+            or not math.isfinite(end_time)
+            or start_time < 0
+            or end_time <= start_time
+        ):
+            logger.error("Invalid clip timestamps.")
+            return False
+
+        # 2. Find FFmpeg
+        ffmpeg_path = get_ffmpeg_path()
+
+        if not ffmpeg_path:
+            return False
+
+        # 3. Prepare output paths
+        output_path = os.path.abspath(output_path)
+
+        if not output_path.lower().endswith(".mp4"):
+            output_path = os.path.splitext(output_path)[0] + ".mp4"
+
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+
+        temp_path = os.path.splitext(output_path)[0] + "_temp.avi"
+
+        # Remove an old output so a failed conversion
+        # cannot accidentally return a stale video.
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+        # 4. Open source video
+        cap = cv2.VideoCapture(input_path)
+
+        if not cap.isOpened():
+            logger.error("Cannot open input video.")
+            return False
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        if not math.isfinite(fps) or fps <= 0:
+            fps = 25.0
+
+        src_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if src_width <= 0 or src_height <= 0:
+            logger.error("Invalid source video dimensions.")
+            return False
+
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+
+        duration = (
+            frame_count / fps
+            if frame_count > 0
+            else 0
+        )
+
+        if duration > 0:
+            end_time = min(end_time, duration)
+
+        if end_time <= start_time:
+            logger.error("Requested clip is outside video duration.")
+            return False
+
+        logger.info(
+            "Source: %dx%d | %.2f FPS | %.2f seconds",
+            src_width,
+            src_height,
+            fps,
+            duration
+        )
+
+        # 5. Seek to requested start time
+        cap.set(
+            cv2.CAP_PROP_POS_MSEC,
+            start_time * 1000.0
+        )
+
+        actual_position = cap.get(
+            cv2.CAP_PROP_POS_MSEC
+        ) / 1000.0
+
+        logger.info(
+            "Requested start: %.3f | Actual seek: %.3f",
+            start_time,
+            actual_position
+        )
+
+        # 6. Calculate output dimensions
+        target_width, target_height = _compute_target_resolution(
+            src_width,
+            src_height
+        )
+
+        logger.info(
+            "Output resolution: %dx%d",
+            target_width,
+            target_height
+        )
+
+        # 7. Initialize temporary writer
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+
+        out = cv2.VideoWriter(
+            temp_path,
+            fourcc,
+            fps,
+            (target_width, target_height)
+        )
+
+        if not out.isOpened():
+            logger.error("Could not initialize temporary video writer.")
+            return False
+
+        # 8. Load optional super-resolution model
+        sr = init_super_res()
+
+        # 9. Process frames
+        frames_written = 0
+        previous_timestamp = -1.0
+
+        while True:
+
+            ret, frame = cap.read()
+
+            if not ret:
+                break
+
+            timestamp = (
+                cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            )
+
+            # Fallback for unreliable video timestamps.
+            if (
+                not math.isfinite(timestamp)
+                or timestamp <= previous_timestamp
+                or timestamp <= 0
+            ):
+                current_frame = cap.get(
+                    cv2.CAP_PROP_POS_FRAMES
+                )
+
+                timestamp = max(
+                    0.0,
+                    (current_frame - 1) / fps
+                )
+
+            previous_timestamp = timestamp
+
+            if timestamp >= end_time:
+                break
+
+            # Optional AI super-resolution
+            if sr is not None:
+                try:
+                    frame = sr.upsample(frame)
+
+                except Exception:
+                    logger.exception(
+                        "Super-resolution failed. "
+                        "Switching to normal resizing."
+                    )
+                    sr = None
+
+            # Resize while preserving aspect ratio.
+            interpolation = (
+                cv2.INTER_LANCZOS4
+                if target_width > src_width
+                else cv2.INTER_AREA
+            )
+
+            frame = cv2.resize(
+                frame,
+                (target_width, target_height),
+                interpolation=interpolation
+            )
+
+            out.write(frame)
+            frames_written += 1
+
+        logger.info("Frames extracted: %d", frames_written)
+
+        if frames_written == 0:
+            logger.error("No frames extracted.")
+            return False
+
+        # 10. Release OpenCV resources
+        cap.release()
+        cap = None
+
+        out.release()
+        out = None
+
+        # 11. Convert to browser-compatible H.264 MP4
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i", temp_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-an",
+            output_path
+        ]
+
+        logger.info("Converting video to H.264 MP4...")
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            logger.error(
+                "FFmpeg conversion failed:\n%s",
+                result.stderr[-3000:]
+            )
+            return False
+
+        # 12. Verify output
+        if (
+            not os.path.isfile(output_path)
+            or os.path.getsize(output_path) == 0
+        ):
+            logger.error("Generated MP4 is missing or empty.")
+            return False
+
+        logger.info(
+            "SUCCESS: Generated browser-compatible video: %s",
+            output_path
+        )
+
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg conversion timed out.")
+        return False
+
+    except Exception:
+        logger.exception("Clip extraction failed.")
+        return False
+
+    finally:
+
+        if cap is not None:
+            cap.release()
+
+        if out is not None:
+            out.release()
+
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+
+            except OSError:
+                logger.warning(
+                    "Could not remove temporary file: %s",
+                    temp_path
+                )

@@ -23,6 +23,25 @@ interface StatusResponse {
   event_count: number;
 }
 
+interface AppearanceResult {
+  video_id: string;
+  filename: string | null;
+  track_id: number | null;
+  timestamp: number | null;
+  frame_number: number | null;
+  upper_color: string;
+  upper_color_confidence: number;
+  crop_url: string | null;
+  clip_url: string | null;
+}
+
+interface AppearanceResponse {
+  found: boolean;
+  results: AppearanceResult[];
+  total: number;
+  query: string;
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 let currentVideoId: string | null = null;
 let pollingTimer: ReturnType<typeof setInterval> | null = null;
@@ -85,27 +104,70 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <h2>Natural Language Query</h2>
           <p>Ask questions about your footage in plain English</p>
         </div>
-        <div class="query-input-container">
-          <input
-            type="text"
-            id="queryInput"
-            class="query-input"
-            placeholder="e.g., 'Show me when a person appears' or 'Find cars in the video'"
-          />
-          <button id="searchBtn" class="btn btn-primary">
-            <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            Search
+
+        <!-- Search Mode Tabs -->
+        <div class="search-tabs">
+          <button class="search-tab active" id="tabObject" data-tab="object">
+            🔍 Object Search
+          </button>
+          <button class="search-tab" id="tabAppearance" data-tab="appearance">
+            👕 Appearance Search
           </button>
         </div>
-        <div class="query-examples">
-          <p>Try these examples:</p>
-          <div class="example-chips">
-            <button class="chip" data-query="person walking">Person walking</button>
-            <button class="chip" data-query="car driving">Car driving</button>
-            <button class="chip" data-query="show me cats">Show cats</button>
-            <button class="chip" data-query="person with backpack">Person with backpack</button>
+
+        <!-- Object Search Panel -->
+        <div id="objectSearchPanel">
+          <div class="query-input-container">
+            <input
+              type="text"
+              id="queryInput"
+              class="query-input"
+              placeholder="e.g., 'Show me when a person appears' or 'Find cars in the video'"
+            />
+            <button id="searchBtn" class="btn btn-primary">
+              <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              Search
+            </button>
+          </div>
+          <div class="query-examples">
+            <p>Try these examples:</p>
+            <div class="example-chips">
+              <button class="chip" data-query="person walking">Person walking</button>
+              <button class="chip" data-query="car driving">Car driving</button>
+              <button class="chip" data-query="show me cats">Show cats</button>
+              <button class="chip" data-query="person with backpack">Person with backpack</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Appearance Search Panel -->
+        <div id="appearanceSearchPanel" style="display:none;">
+          <div class="query-input-container">
+            <input
+              type="text"
+              id="appearanceInput"
+              class="query-input"
+              placeholder="e.g., 'orange T-shirt', 'blue jacket', 'black shirt'"
+            />
+            <button id="appearanceSearchBtn" class="btn btn-primary">
+              <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              Search
+            </button>
+          </div>
+          <div class="query-examples">
+            <p>Try these examples:</p>
+            <div class="example-chips" id="appearanceChips">
+              <button class="chip appearance-chip" data-query="orange shirt">🟠 Orange</button>
+              <button class="chip appearance-chip" data-query="blue shirt">🔵 Blue</button>
+              <button class="chip appearance-chip" data-query="black jacket">⚫ Black</button>
+              <button class="chip appearance-chip" data-query="red shirt">🔴 Red</button>
+              <button class="chip appearance-chip" data-query="white shirt">⚪ White</button>
+              <button class="chip appearance-chip" data-query="pink shirt">🩷 Pink</button>
+            </div>
           </div>
         </div>
       </section>
@@ -116,6 +178,14 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
           <h2>Search Results</h2>
         </div>
         <div id="resultsContent"></div>
+      </section>
+
+      <!-- Appearance Results Section -->
+      <section class="card results-section" id="appearanceResultsSection" style="display: none;">
+        <div class="card-header">
+          <h2>Appearance Search Results</h2>
+        </div>
+        <div id="appearanceResultsContent"></div>
       </section>
     </main>
 
@@ -139,6 +209,36 @@ const searchBtn         = document.getElementById('searchBtn')         as HTMLBu
 const resultsSection    = document.getElementById('resultsSection')    as HTMLElement;
 const resultsContent    = document.getElementById('resultsContent')    as HTMLDivElement;
 const statusText        = document.getElementById('statusText')        as HTMLSpanElement;
+
+// Appearance DOM refs
+const tabObject              = document.getElementById('tabObject')              as HTMLButtonElement;
+const tabAppearance          = document.getElementById('tabAppearance')          as HTMLButtonElement;
+const objectSearchPanel      = document.getElementById('objectSearchPanel')      as HTMLDivElement;
+const appearanceSearchPanel  = document.getElementById('appearanceSearchPanel')  as HTMLDivElement;
+const appearanceInput        = document.getElementById('appearanceInput')        as HTMLInputElement;
+const appearanceSearchBtn    = document.getElementById('appearanceSearchBtn')    as HTMLButtonElement;
+const appearanceResultsSection = document.getElementById('appearanceResultsSection') as HTMLElement;
+const appearanceResultsContent = document.getElementById('appearanceResultsContent') as HTMLDivElement;
+
+// ── Search tab switching ──────────────────────────────────────────────────────
+function switchTab(tab: 'object' | 'appearance') {
+  if (tab === 'object') {
+    tabObject.classList.add('active');
+    tabAppearance.classList.remove('active');
+    objectSearchPanel.style.display = 'block';
+    appearanceSearchPanel.style.display = 'none';
+    appearanceResultsSection.style.display = 'none';
+  } else {
+    tabAppearance.classList.add('active');
+    tabObject.classList.remove('active');
+    appearanceSearchPanel.style.display = 'block';
+    objectSearchPanel.style.display = 'none';
+    resultsSection.style.display = 'none';
+  }
+}
+
+tabObject.addEventListener('click', () => switchTab('object'));
+tabAppearance.addEventListener('click', () => switchTab('appearance'));
 
 // ── Upload ────────────────────────────────────────────────────────────────────
 uploadArea.addEventListener('click', () => fileInput.click());
@@ -251,12 +351,23 @@ queryInput.addEventListener('keypress', (e) => {
   if (e.key === 'Enter') handleSearch();
 });
 
-document.querySelectorAll('.chip').forEach(chip => {
+document.querySelectorAll('.chip:not(.appearance-chip)').forEach(chip => {
   chip.addEventListener('click', () => {
     const query = chip.getAttribute('data-query');
     if (query) {
       queryInput.value = query;
       handleSearch();
+    }
+  });
+});
+
+// Appearance chip clicks
+document.querySelectorAll('.appearance-chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    const query = chip.getAttribute('data-query');
+    if (query) {
+      appearanceInput.value = query;
+      handleAppearanceSearch();
     }
   });
 });
@@ -535,4 +646,148 @@ function formatTime(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+// ── Appearance search handlers ────────────────────────────────────────────────
+appearanceSearchBtn.addEventListener('click', handleAppearanceSearch);
+appearanceInput.addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') handleAppearanceSearch();
+});
+
+async function handleAppearanceSearch() {
+  const query = appearanceInput.value.trim();
+  if (!query) return;
+
+  appearanceSearchBtn.disabled = true;
+  appearanceSearchBtn.innerHTML = `
+    <svg class="btn-icon spinning" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+    </svg>
+    Searching...
+  `;
+
+  try {
+    const body: Record<string, unknown> = { query, confidence_min: 0.3, limit: 30 };
+    if (currentVideoId) body.video_id = currentVideoId;
+
+    const response = await fetch(`${API_BASE}/appearance-search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const data: AppearanceResponse = await response.json();
+    displayAppearanceResults(data);
+
+  } catch (error) {
+    console.error('Appearance search error:', error);
+    alert('Appearance search failed. Please try again.');
+  } finally {
+    appearanceSearchBtn.disabled = false;
+    appearanceSearchBtn.innerHTML = `
+      <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+      </svg>
+      Search
+    `;
+  }
+}
+
+const COLOR_HEX: Record<string, string> = {
+  red: '#e53935', orange: '#ff6b35', yellow: '#fdd835',
+  green: '#43a047', blue: '#1e88e5', purple: '#8e24aa',
+  pink: '#e91e63', white: '#f5f5f5', black: '#212121',
+  other: '#9e9e9e', unknown: '#757575',
+};
+
+function displayAppearanceResults(data: AppearanceResponse) {
+  appearanceResultsSection.style.display = 'block';
+
+  if (!data.found || !data.results || data.results.length === 0) {
+    appearanceResultsContent.innerHTML = `
+      <div class="no-results">
+        <svg class="no-results-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <h3>No Matching Appearance Found</h3>
+        <p>No people matching that clothing colour were detected. Try a different colour or upload more footage.</p>
+        <div class="tip-box">
+          <p><strong>Note:</strong> Appearance search only works on videos processed after this feature was enabled.</p>
+        </div>
+      </div>
+    `;
+    appearanceResultsSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return;
+  }
+
+  appearanceResultsContent.innerHTML = `
+    <div class="result-found">
+      <div class="result-header">
+        <h3>Found ${data.total} person appearance${data.total !== 1 ? 's' : ''}</h3>
+        <p class="query-text">Query: &ldquo;${data.query}&rdquo;</p>
+      </div>
+      <div class="appearance-results-grid">
+        ${data.results.map(r => buildAppearanceCard(r)).join('')}
+      </div>
+    </div>
+  `;
+
+  // Wire "View Clip" buttons
+  document.querySelectorAll<HTMLButtonElement>('.appearance-clip-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const url = btn.getAttribute('data-clip-url');
+      if (!url) return;
+      // Show in a simple overlay or switch to object results video panel
+      const overlay = document.createElement('div');
+      overlay.className = 'appearance-clip-overlay';
+      overlay.innerHTML = `
+        <div class="appearance-clip-modal">
+          <button class="appearance-clip-close" id="closeClipModal">✕ Close</button>
+          <video controls autoplay class="result-video" src="${url}">
+            Your browser does not support video.
+          </video>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+      document.getElementById('closeClipModal')?.addEventListener('click', () => {
+        document.body.removeChild(overlay);
+      });
+    });
+  });
+
+  appearanceResultsSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function buildAppearanceCard(r: AppearanceResult): string {
+  const colorHex = COLOR_HEX[r.upper_color] ?? '#9e9e9e';
+  const confPct  = Math.round((r.upper_color_confidence ?? 0) * 100);
+  const timeStr  = r.timestamp != null ? formatTime(r.timestamp) : '--';
+  const filename = r.filename ?? r.video_id;
+
+  const cropHtml = r.crop_url
+    ? `<img src="${r.crop_url}" alt="Person crop" class="appearance-crop-img" onerror="this.style.display='none'" />`
+    : `<div class="appearance-crop-placeholder">No crop</div>`;
+
+  const clipBtn = r.clip_url
+    ? `<button class="btn btn-secondary appearance-clip-btn" data-clip-url="${r.clip_url}" style="font-size:0.75rem;padding:0.35rem 0.8rem;">▶ View Clip</button>`
+    : `<span class="appearance-no-clip">No clip yet</span>`;
+
+  return `
+    <div class="appearance-card">
+      ${cropHtml}
+      <div class="appearance-card-body">
+        <div class="color-badge">
+          <span class="color-dot" style="background:${colorHex}"></span>
+          <span class="color-label">${r.upper_color}</span>
+          <span class="color-conf">${confPct}%</span>
+        </div>
+        <div class="appearance-meta">
+          <span>⏱ ${timeStr}</span>
+          ${r.track_id != null ? `<span>🏷 Track ${r.track_id}</span>` : ''}
+        </div>
+        <div class="appearance-filename" title="${filename}">${filename}</div>
+        <div class="appearance-actions">${clipBtn}</div>
+      </div>
+    </div>
+  `;
 }

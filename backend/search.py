@@ -8,7 +8,7 @@ Fixes over original:
 - Confidence returned in result for frontend display
 """
 
-from database import SessionLocal, Event
+from database import SessionLocal, Event, AppearanceObservation, Video
 from sqlalchemy.orm import Session
 import logging
 
@@ -158,3 +158,127 @@ def search_events(query: str, video_id: str, threshold: float = 0.5):
 
     results.sort(key=lambda x: (-x["score"], x["timestamp"]))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Appearance colour search
+# ---------------------------------------------------------------------------
+
+# Supported colour names (canonical, lowercase)
+SUPPORTED_COLORS = {
+    "red", "orange", "yellow", "green",
+    "blue", "purple", "pink", "white",
+    "black", "other",
+}
+
+# Colour synonyms for natural-language query parsing
+_COLOR_SYNONYMS: dict[str, str] = {
+    "red": "red",
+    "orange": "orange",
+    "yellow": "yellow",
+    "green": "green",
+    "blue": "blue",
+    "purple": "purple",
+    "violet": "purple",
+    "pink": "pink",
+    "white": "white",
+    "black": "black",
+    "dark": "black",
+    "navy": "blue",
+    "teal": "green",
+    "cyan": "blue",
+    "maroon": "red",
+    "crimson": "red",
+    "magenta": "pink",
+    "grey": "other",
+    "gray": "other",
+}
+
+
+def _parse_color_query(query: str) -> list[str]:
+    """Extract canonical colour names from a free-text query string."""
+    q = query.lower()
+    found: list[str] = []
+    for word, canonical in _COLOR_SYNONYMS.items():
+        if word in q and canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def search_appearances(
+    query: str,
+    video_id: str | None = None,
+    color_confidence_min: float = 0.3,
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Search AppearanceObservation records for people whose upper clothing
+    matches the colour(s) described in *query*.
+
+    Parameters
+    ----------
+    query               : Free-text query, e.g. "orange T-shirt" or "blue shirt"
+    video_id            : Filter to a specific video; None = search all videos
+    color_confidence_min: Minimum upper_color_confidence to include
+    limit               : Maximum number of results returned
+
+    Returns
+    -------
+    List of dicts ordered by upper_color_confidence DESC, timestamp ASC.
+    Each dict:
+        video_id, filename, track_id, timestamp, frame_number,
+        upper_color, upper_color_confidence, crop_path
+    """
+    colors = _parse_color_query(query)
+
+    if not colors:
+        logger.warning("search_appearances: no colour recognised in query %r", query)
+        return []
+
+    db = SessionLocal()
+    try:
+        q = db.query(AppearanceObservation, Video).join(
+            Video, Video.id == AppearanceObservation.video_id, isouter=True
+        )
+
+        q = q.filter(AppearanceObservation.upper_color.in_(colors))
+        q = q.filter(
+            AppearanceObservation.upper_color_confidence >= color_confidence_min
+        )
+
+        if video_id is not None:
+            q = q.filter(AppearanceObservation.video_id == video_id)
+
+        q = q.order_by(
+            AppearanceObservation.upper_color_confidence.desc(),
+            AppearanceObservation.timestamp.asc(),
+        )
+
+        rows = q.limit(limit).all()
+
+        results: list[dict] = []
+        seen_tracks: set[tuple] = set()
+
+        for obs, video in rows:
+            # Deduplicate by (video_id, track_id) — keep highest-confidence
+            dedup_key = (obs.video_id, obs.track_id)
+            if obs.track_id is not None and dedup_key in seen_tracks:
+                continue
+            seen_tracks.add(dedup_key)
+
+            results.append({
+                "video_id": obs.video_id,
+                "filename": video.filename if video else None,
+                "track_id": obs.track_id,
+                "timestamp": obs.timestamp,
+                "frame_number": obs.frame_number,
+                "upper_color": obs.upper_color,
+                "upper_color_confidence": obs.upper_color_confidence,
+                "crop_path": obs.crop_path,
+            })
+
+        return results
+
+    finally:
+        db.close()
+
